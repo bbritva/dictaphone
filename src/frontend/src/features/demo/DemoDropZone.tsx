@@ -48,9 +48,13 @@ export function DemoDropZone({
       <div className="demo-drop__title">{title}</div>
       <div
         {...getRootProps({
-          className: `demo-drop__zone${isDragActive ? ' demo-drop__zone--active' : ''}${
-            file ? ' demo-drop__zone--filled' : ''
-          }`,
+          // The highlight is only ever the "a file is hovering over me" state.
+          // `isDragActive` is not reliably cleared once a drop has landed, so a
+          // zone that holds a file never renders it: otherwise a successful
+          // drop leaves the zone lit up as though it were still waiting.
+          className: `demo-drop__zone${
+            isDragActive && !file ? ' demo-drop__zone--active' : ''
+          }${file ? ' demo-drop__zone--filled' : ''}`,
         })}
       >
         <input {...getInputProps()} data-testid={`demo-input-${title}`} />
