@@ -32,6 +32,11 @@ const PersonalDataPage = React.lazy(
 const serviceProvisionAgreement = React.lazy(
   () => import('@/pages/legal/ServiceProvisionAgreement')
 )
+// Demo-only page: drop a transcript, a glossary and an .ics, see the two
+// transcript-quality stages run on them. Not part of the product flow.
+const DemoTranscriptQualityPage = React.lazy(
+  () => import('@/pages/DemoTranscriptQualityPage.tsx')
+)
 
 // We avoid arriving directly on the new recording page
 const pathname = window.location.pathname.replace(/\/+$/, '')
@@ -115,6 +120,11 @@ function App() {
               key={'download-mobile-app'}
               path={'/download-mobile-app'}
               component={DownloadMobileAppPage}
+            />
+            <Route
+              key={'demo'}
+              path={'/demo'}
+              component={DemoTranscriptQualityPage}
             />
             {/*<Route*/}
             {/*  key={'trash'}*/}

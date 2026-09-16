@@ -19,6 +19,7 @@
 @use './../features/recordings/components/ListRecordings';
 @use './../features/recordings/components/Transcript';
 @use './../features/files/components/FileUploadToast';
+@use './../features/demo/DemoTranscriptQuality';
 @use './../features/ui/components/toaster';
 @use './../pages/DownloadMobileAppPage';
 @use './../pages/RecordingPage';

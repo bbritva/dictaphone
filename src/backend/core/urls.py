@@ -8,6 +8,7 @@ from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from core.api import (
+    demo,
     get_app_configuration,
     get_mobile_app_download_page,
     viewsets,
@@ -42,6 +43,18 @@ urlpatterns = [
                     "download-mobile-app/",
                     get_mobile_app_download_page,
                     name="download-mobile-app",
+                ),
+                # Demo-only, for the /demo page. Proxies the summary service's
+                # own demo route; touches no File and no AiFileJob.
+                path(
+                    "demo/transcript-quality/run/",
+                    demo.run_transcript_quality_demo,
+                    name="demo-transcript-quality-run",
+                ),
+                path(
+                    "demo/transcript-quality/publish/",
+                    demo.publish_transcript_quality_demo,
+                    name="demo-transcript-quality-publish",
                 ),
             ]
         ),
