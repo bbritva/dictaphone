@@ -239,3 +239,53 @@
 .demo-quote {
   max-width: 28rem;
 }
+
+// One sentence above the detail, saying what the run did. A run that changed
+// nothing renders as two identical transcripts; without this it reads as a
+// failure rather than as the result it is.
+.demo-outcome {
+  border-left: 4px solid var(--c--theme--colors--success-600, #18753c);
+  background: var(--c--theme--colors--success-100, #eefbf3);
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+  line-height: 1.5;
+
+  &--flat {
+    border-left-color: var(--c--theme--colors--greyscale-500, #666);
+    background: var(--c--theme--colors--greyscale-100, #f5f5f5);
+  }
+}
+
+// The transcript-quality panel on the recording page. Collapsed by default, so
+// the recording page a teammate opens is the one they have always seen.
+.recording-quality {
+  margin-top: 2rem;
+  border-top: 1px solid var(--c--theme--colors--greyscale-200, #ddd);
+
+  &__toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.75rem 0;
+    background: none;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 700;
+    text-align: left;
+    color: var(--c--theme--colors--greyscale-700, #3a3a3a);
+
+    &:hover {
+      color: var(--c--theme--colors--greyscale-1000, #161616);
+    }
+
+    &__chevron {
+      font-size: 0.8em;
+    }
+  }
+
+  &__body {
+    padding: 0 0 2rem;
+  }
+}

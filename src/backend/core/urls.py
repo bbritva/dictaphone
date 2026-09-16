@@ -44,12 +44,20 @@ urlpatterns = [
                     get_mobile_app_download_page,
                     name="download-mobile-app",
                 ),
-                # Demo-only, for the /demo page. Proxies the summary service's
-                # own demo route; touches no File and no AiFileJob.
+                # Demo-only. Proxies the summary service's own demo route.
+                # Neither of these writes anything: no File and no AiFileJob is
+                # created, updated or deleted by either.
                 path(
                     "demo/transcript-quality/run/",
                     demo.run_transcript_quality_demo,
                     name="demo-transcript-quality-run",
+                ),
+                # Same run, over a transcript already stored for an AI job,
+                # for the panel on the recording page. Read-only.
+                path(
+                    "demo/transcript-quality/ai-jobs/<uuid:pk>/run/",
+                    demo.run_transcript_quality_demo_on_job,
+                    name="demo-transcript-quality-run-on-job",
                 ),
                 path(
                     "demo/transcript-quality/publish/",

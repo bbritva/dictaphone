@@ -40,6 +40,9 @@ import {
   ToasterItem,
 } from '@/features/ui/components/toaster/Toaster.tsx'
 import { useConfig } from '@/api/useConfig'
+// Demo-scoped panel, collapsed by default: it changes nothing about the page
+// until someone opens it, and it never writes to the recording.
+import { RecordingQualityPanel } from '@/features/demo/RecordingQualityPanel'
 
 function OpenInDocsButton({
   lastAiJobTranscript,
@@ -334,6 +337,10 @@ export default function RecordingPage({
             seekTo={seekTo}
             currentTime={currentTime}
             setTranscriptSegments={setTranscriptSegments}
+          />
+          <RecordingQualityPanel
+            aiJobId={lastAiJobTranscript?.id ?? null}
+            isTranscriptReady={lastAiJobTranscript?.status === 'success'}
           />
         </div>
       </div>

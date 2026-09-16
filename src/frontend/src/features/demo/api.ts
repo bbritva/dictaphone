@@ -121,6 +121,30 @@ export const runDemo = (files: {
   return post<DemoReport>('demo/transcript-quality/run/', { body: form })
 }
 
+/**
+ * Same run, over a transcript Dictaphone already stores.
+ *
+ * The transcript is not sent: the server reads it from the AI job. Both side
+ * files are optional -- a run with neither is a real run, showing what the
+ * service's own shipped glossary does alone.
+ */
+export const runJobDemo = (
+  aiJobId: string,
+  files: { glossary: File | null; calendar: File | null }
+) => {
+  const form = new FormData()
+  if (files.glossary) {
+    form.append('glossary', files.glossary)
+  }
+  if (files.calendar) {
+    form.append('calendar', files.calendar)
+  }
+  return post<DemoReport>(
+    `demo/transcript-quality/ai-jobs/${aiJobId}/run/`,
+    { body: form }
+  )
+}
+
 export const publishDemo = (runId: string, which: 'before' | 'after') =>
   post<DemoPublished>('demo/transcript-quality/publish/', {
     body: JSON.stringify({
