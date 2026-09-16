@@ -16,6 +16,20 @@ export type TranscriptViewSegment = {
   words: TranscriptWord[]
 }
 
+/** WhisperX's own diarization labels -- the only ones worth renumbering. */
+const DIARIZER_LABEL = /^SPEAKER_\d+$/i
+
+/**
+ * How one speaker is written, given the word for "participant".
+ *
+ * A numbered speaker is the diarizer's: it means nothing on its own and needs
+ * the word in front of it ("Participant 2"). A named speaker is already the
+ * label, and prefixing it would read "Participant Nadia Berger".
+ */
+export function formatSpeaker(speaker: string, speakerLabel: string): string {
+  return /^\d+$/.test(speaker) ? `${speakerLabel} ${speaker}` : speaker
+}
+
 const MAX_SEGMENT_DURATION = 60
 function groupTranscriptSegments(
   segments: TranscriptViewSegment[]
@@ -64,6 +78,15 @@ export function buildTranscriptViewSegments(
   const speakerMapped = new Map<string, string>()
   const getSpeaker = (speaker: string | null): string | null => {
     if (!speaker) return null
+
+    // A transcript that has been through speaker resolution carries a real
+    // name here instead of WhisperX's `SPEAKER_00`. Renumbering it would throw
+    // away the one thing that stage produced, so only the diarizer's own
+    // labels are renumbered. Every transcript the audio path produces has only
+    // those, so this changes nothing for them.
+    if (!DIARIZER_LABEL.test(speaker)) {
+      return speaker
+    }
 
     if (!speakerMapped.has(speaker)) {
       speakerMapped.set(speaker, String(speakerMapped.size + 1))
@@ -182,7 +205,10 @@ export function buildTranscriptMarkdown({
 
   let out = `# ${title}\n\n`
   transcriptSegments.forEach((segment) => {
-    out += `**${formatTimestamp(segment.start ?? -1)} · ${speakerLabel} ${segment.speaker}** ${segment.text} \n\n`
+    out += `**${formatTimestamp(segment.start ?? -1)} · ${formatSpeaker(
+      segment.speaker ?? '',
+      speakerLabel
+    )}** ${segment.text} \n\n`
   })
 
   return out.trim()
@@ -488,7 +514,7 @@ export function buildTranscriptSrt(
     const tokens = buildSubtitleTokens(segment)
     const speakerToken = includeSpeakerLabel
       ? {
-          text: `${speakerLabel} ${segment.speaker}:`,
+          text: `${formatSpeaker(segment.speaker ?? '', speakerLabel)}:`,
           start: null,
           end: null,
         }

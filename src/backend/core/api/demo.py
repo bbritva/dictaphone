@@ -12,8 +12,8 @@ and must not reach the browser. Nothing else is added -- the summary service's
 JSON is passed through untouched, so the page shows what the pipeline actually
 returned.
 
-Two ways in
------------
+Three ways in
+-------------
 `run_transcript_quality_demo` is the `/demo` page: the transcript is uploaded
 by the user, and no stored object is involved at all.
 
@@ -23,23 +23,36 @@ a glossary and an attendee list can be tried against a real recording. It reads
 the stored JSON and forwards it under the same `transcript` field, which is why
 the summary service needs no change to serve both.
 
+`import_transcript_as_recording` is the third one, and the only one that keeps
+anything: the transcript is uploaded like on `/demo`, but the corrected result
+is stored as a real recording, so it shows up in the list and opens like any
+other. What that costs and how it is done is documented on the function.
+
 What this does NOT touch
 ------------------------
-No write, ever. Nothing here creates, updates or deletes a `File` or an
-`AiFileJob`, and nothing is written back to storage. The job-backed route opens
-the stored transcript read-only and hands the bytes to the summary service; the
-corrected transcript exists only in the response the browser receives. The
-normal audio ingestion path (upload -> extract audio -> transcribe -> webhook)
-is not involved and is not changed.
+The first two routes never write: nothing they do creates, updates or deletes
+a `File` or an `AiFileJob`, and nothing is written back to storage.
+
+The third one does write, and only through the ordinary models -- a `File` and
+one `AiFileJob` of type `transcript`, created the way the audio path creates
+them. No model behaviour is overridden and no task is bypassed, because no task
+is involved: there is no audio to extract and nothing to transcribe.
+
+The normal audio ingestion path (upload -> extract audio -> transcribe ->
+webhook) is not involved in any of the three and is not changed by any of them.
 """
 
+import json
 import logging
+from os.path import splitext
 
 from django.conf import settings
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 
 import requests as requests_lib
+from botocore.exceptions import BotoCoreError, ClientError
+from pydantic import ValidationError
 from rest_framework import status
 from rest_framework.decorators import (
     api_view,
@@ -50,8 +63,19 @@ from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from core.models import AiFileJob, AiJobStatusChoices, AiJobTypeChoices
-from core.storage import get_storage_for_file
+from core.models import (
+    AiFileJob,
+    AiJobStatusChoices,
+    AiJobTypeChoices,
+    File,
+    FileAudioExtractionStateChoices,
+    FileLifecycleStateChoices,
+    FileSourceChoices,
+    FileTypeChoices,
+    FileUploadStateChoices,
+)
+from core.storage import get_storage_bucket_name, get_storage_for_file
+from core.webhook_models import WhisperXResponse
 
 logger = logging.getLogger(__name__)
 
@@ -284,3 +308,255 @@ def run_transcript_quality_demo_on_job(request, pk):
         )
 
     return _forward(response)
+
+
+#: The imported recording carries no audio, so there is nothing to play and
+#: nothing to download. `original_data_deleted` is the state the product
+#: already has for exactly that shape -- `ListFileSerializer.get_url` returns
+#: None for it, the recording page hides the player instead of handing it a
+#: null `src`, and "relancer la transcription" is disabled because there is no
+#: audio to transcribe again. Reusing it is what keeps this route from needing
+#: a new state, a new serializer branch, or a change to the audio path.
+#:
+#: The one thing it gets wrong is the wording: the page says "fichier conservé
+#: jusqu'au ..." rather than "audio conservé jusqu'au ...", which reads as "the
+#: audio was deleted" when the truth is "there never was any". `source` carries
+#: that truth: see `FileSourceChoices.IMPORTED_TRANSCRIPT`.
+IMPORTED_LIFECYCLE_STATE = FileLifecycleStateChoices.ORIGINAL_DATA_DELETED
+
+
+def _duration_of(transcript: WhisperXResponse) -> float:
+    """Return the last timestamp in the transcript, in seconds.
+
+    `File.duration_seconds` is not nullable and the list shows it, so it has to
+    be something. The end of the last timed segment is the honest answer: it is
+    how long the conversation this transcript describes ran, measured from the
+    transcript itself rather than invented.
+    """
+    ends = [segment.end for segment in transcript.segments if segment.end is not None]
+    return float(max(ends)) if ends else 0.0
+
+
+def _corrected_transcript_of(payload):
+    """Pull the corrected WhisperX transcript out of a summary-service report.
+
+    The report is the summary service's, so this validates it against
+    Dictaphone's own `WhisperXResponse` before anything is stored. Getting this
+    wrong is invisible at write time and fatal at read time: `to_markdown` and
+    the transcript proxy both re-validate, so a transcript that does not fit
+    would store fine and then break "Ouvrir dans Docs" and the recording page.
+
+    Returns:
+        A `(transcript, raw, error_response)` triple. `error_response` is None
+        on success.
+    """
+    after = payload.get("after") or {}
+    raw = after.get("transcript")
+    if raw is None:
+        return (
+            None,
+            None,
+            Response(
+                {
+                    "error": "Le service de résumé n'a pas renvoyé le transcript "
+                    "corrigé (champ « after.transcript »). Version trop "
+                    "ancienne du service ?"
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            ),
+        )
+    try:
+        transcript = WhisperXResponse.model_validate(raw)
+    except ValidationError as exc:
+        logger.error("Corrected transcript does not validate: %s", exc)
+        return (
+            None,
+            None,
+            Response(
+                {
+                    "error": "Le transcript corrigé renvoyé par le service de "
+                    f"résumé n'a pas la forme attendue : {str(exc)[:300]}"
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            ),
+        )
+    return transcript, raw, None
+
+
+def _create_imported_recording(user, *, title, filename, transcript, language):
+    """Create the `File` a corrected transcript is attached to.
+
+    Written through the ordinary model, in the ordinary order, so every
+    invariant `File.save` enforces still runs: the configuration snapshot, the
+    storage bucket, the deletion deadlines. The three state fields are set on a
+    second save because the first one forces `pending` on any new file -- that
+    rule is the audio path's and it is left alone.
+    """
+    file = File(
+        type=FileTypeChoices.AUDIO_RECORDING,
+        title=title,
+        creator=user,
+        filename=filename,
+        duration_seconds=_duration_of(transcript),
+        mimetype="application/json",
+        language=language,
+        source=FileSourceChoices.IMPORTED_TRANSCRIPT,
+    )
+    file.save()
+
+    # `ready` is what the list filters on, and it is true: there is nothing
+    # still uploading. `extraction_done` is what the recording page reads to
+    # decide whether to keep saying "extraction en cours"; there is no audio,
+    # so the extraction is as done as it will ever be.
+    file.upload_state = FileUploadStateChoices.READY
+    file.audio_extraction_state = FileAudioExtractionStateChoices.EXTRACTION_DONE
+    file.lifecycle_state = IMPORTED_LIFECYCLE_STATE
+    file.save(
+        update_fields=["upload_state", "audio_extraction_state", "lifecycle_state"]
+    )
+    return file
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser])
+def import_transcript_as_recording(  # noqa: PLR0911  pylint: disable=too-many-return-statements
+    request,
+):
+    """Correct a transcript handed to us, and keep the result as a recording.
+
+    Same three uploads as `/demo`, same single call to the summary service. The
+    difference is what happens to the answer: instead of being rendered once on
+    a page and thrown away, the corrected transcript is stored as the
+    `AiFileJob` of a new `File`, so it lands in `/recordings` and opens like
+    anything else.
+
+    No audio exists anywhere in this flow. The route creates no upload, queues
+    no task and calls no transcription: the transcript is the input, so every
+    stage before the correction has already happened elsewhere.
+
+    The full report is returned alongside the new file, because the numbers it
+    carries -- what was flagged, what was corrected, and why nothing was when
+    nothing was -- are exactly as relevant here as on `/demo`, and are gone
+    once the response is discarded.
+    """
+    upload = request.FILES.get("transcript")
+    if upload is None:
+        return Response(
+            {"error": "Le fichier « transcript » est obligatoire."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if upload.size > MAX_UPLOAD_BYTES:
+        return Response(
+            {
+                "error": f"« {upload.name} » dépasse la taille maximale "
+                f"({MAX_UPLOAD_BYTES // (1024 * 1024)} Mo)."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    files, error = _read_uploaded_side_files(request)
+    if error is not None:
+        return error
+    files["transcript"] = (upload.name, upload.read(), upload.content_type)
+
+    language = request.data.get("language") or "fr"
+
+    try:
+        response = requests_lib.post(
+            _summary_service_url("demo/transcript-quality/run"),
+            files=files,
+            headers={"Authorization": f"Bearer {settings.AI_SERVICE_API_KEY}"},
+            timeout=DEMO_TIMEOUT_SECONDS,
+        )
+    except requests_lib.RequestException as exc:
+        logger.error("Transcript import run failed: %s", exc)
+        return Response(
+            {"error": f"Le service de résumé est injoignable : {exc}"},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    # A refused or failed run is reported exactly as `/demo` reports it, and
+    # nothing is created: a recording is only worth keeping if the correction
+    # actually ran.
+    if not response.ok:
+        return _forward(response)
+    try:
+        payload = response.json()
+    except ValueError:
+        return _forward(response)
+
+    transcript, raw, error = _corrected_transcript_of(payload)
+    if error is not None:
+        return error
+
+    title = (request.data.get("title") or "").strip()
+    if not title:
+        title = splitext(upload.name)[0] or "Transcript importé"
+
+    file = _create_imported_recording(
+        request.user,
+        title=title[:255],
+        filename=upload.name,
+        transcript=transcript,
+        language=language,
+    )
+
+    # Created pending, not successful: `AiFileJob.key` needs the row's id, so
+    # the object cannot exist before the row does. Claiming success before the
+    # transcript is readable would put a recording in the list whose transcript
+    # 404s.
+    ai_job = AiFileJob.objects.create(
+        remote_job_id=None,
+        file=file,
+        type=AiJobTypeChoices.TRANSCRIPT,
+        status=AiJobStatusChoices.PENDING,
+        language=language,
+    )
+
+    content = json.dumps(raw).encode("utf-8")
+    storage = get_storage_for_file(file)
+    try:
+        storage.connection.meta.client.put_object(
+            Bucket=get_storage_bucket_name(storage),
+            Key=ai_job.key,
+            Body=content,
+            ContentType="application/json",
+        )
+    except (BotoCoreError, ClientError, OSError) as exc:
+        logger.error("Could not store the imported transcript of %s: %s", file.id, exc)
+        ai_job.status = AiJobStatusChoices.FAILED
+        ai_job.save(update_fields=["status"])
+        return Response(
+            {
+                "error": "Le transcript corrigé n'a pas pu être enregistré : "
+                f"{exc}. L'enregistrement apparaît en échec dans la "
+                "liste."
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    ai_job.status = AiJobStatusChoices.SUCCESS
+    ai_job.save(update_fields=["status"])
+
+    file.size = len(content)
+    file.save(update_fields=["size"])
+
+    logger.info(
+        "Imported transcript stored as file %s (ai job %s), no audio",
+        file.id,
+        ai_job.id,
+    )
+
+    return Response(
+        {
+            **payload,
+            "file": {
+                "id": str(file.id),
+                "title": file.title,
+                "duration_seconds": file.duration_seconds,
+                "ai_job_id": str(ai_job.id),
+            },
+        },
+        status=status.HTTP_201_CREATED,
+    )

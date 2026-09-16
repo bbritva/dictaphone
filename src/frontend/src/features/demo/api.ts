@@ -48,7 +48,11 @@ export interface DemoReport {
     count: number
   }
   before: { markdown: string }
-  after: { markdown: string }
+  // `transcript` is the corrected WhisperX response itself, not its rendering.
+  // Only the import flow reads it -- it is what gets stored as the new
+  // recording's transcript -- so it stays optional and the pages that only
+  // show markdown are unaffected.
+  after: { markdown: string; transcript?: unknown }
   corrections: DemoCorrection[]
   speakers: DemoSpeaker[]
   flagged_spans: string[]
@@ -139,10 +143,47 @@ export const runJobDemo = (
   if (files.calendar) {
     form.append('calendar', files.calendar)
   }
-  return post<DemoReport>(
-    `demo/transcript-quality/ai-jobs/${aiJobId}/run/`,
-    { body: form }
-  )
+  return post<DemoReport>(`demo/transcript-quality/ai-jobs/${aiJobId}/run/`, {
+    body: form,
+  })
+}
+
+/** The report, plus the recording the import created from it. */
+export interface DemoImported extends DemoReport {
+  file: {
+    id: string
+    title: string
+    duration_seconds: number
+    ai_job_id: string
+  }
+}
+
+/**
+ * Correct a transcript and keep the result as a recording.
+ *
+ * Same three files as `runDemo`, same single call to the pipeline. The
+ * difference is on the server: the corrected transcript is stored as a real
+ * `File` + `AiFileJob`, so the answer carries the id of a recording that now
+ * exists in the list, and the report of the run that produced it.
+ */
+export const importTranscript = (input: {
+  transcript: File
+  glossary: File | null
+  calendar: File | null
+  title: string
+}) => {
+  const form = new FormData()
+  form.append('transcript', input.transcript)
+  if (input.glossary) {
+    form.append('glossary', input.glossary)
+  }
+  if (input.calendar) {
+    form.append('calendar', input.calendar)
+  }
+  if (input.title.trim()) {
+    form.append('title', input.title.trim())
+  }
+  return post<DemoImported>('demo/transcript-quality/import/', { body: form })
 }
 
 export const publishDemo = (runId: string, which: 'before' | 'after') =>
@@ -168,7 +209,9 @@ export const SAMPLES = {
 export const loadSample = async (url: string, name: string): Promise<File> => {
   const response = await fetch(url)
   if (!response.ok) {
-    throw new Error(`Exemple « ${name} » introuvable (HTTP ${response.status}).`)
+    throw new Error(
+      `Exemple « ${name} » introuvable (HTTP ${response.status}).`
+    )
   }
   return new File([await response.blob()], name)
 }

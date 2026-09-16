@@ -5,7 +5,12 @@ import { useUploadZone } from '@/hooks/useUpload.tsx'
 import clsx from 'clsx'
 import LogoApp from '@/layout/LogoApp.tsx'
 import { useTranslation } from 'react-i18next'
-import { ChevronDown, FileUp, Warning } from '@gouvfr-lasuite/ui-kit/icons'
+import {
+  ChevronDown,
+  DocMic,
+  FileUp,
+  Warning,
+} from '@gouvfr-lasuite/ui-kit/icons'
 import { useLocation } from 'wouter'
 import { Button, Tooltip } from '@gouvfr-lasuite/cunningham-react'
 import { RecoverList } from '@/features/recordings/components/RecoverList'
@@ -19,6 +24,10 @@ import {
   TranscriptionLanguage,
   useSettingsStore,
 } from '@/features/settings/settingsStore'
+// Demo-scoped third entry point: start from a transcript instead of audio.
+// It sits next to the two audio entries because what it produces is the same
+// thing they produce -- a recording in this list.
+import { ImportTranscriptModal } from '@/features/demo/ImportTranscriptModal'
 
 const PAGE_SIZE = 10
 
@@ -130,6 +139,8 @@ export default function RecordingsPage() {
     setNewTranscriptionLanguage,
   ])
 
+  const [openImportModal, setOpenImportModal] = useState(false)
+
   const [openLangSelection, setOpenLangSelection] = useState(false)
   const langOptions = useMemo<DropdownMenuOption[]>(
     () =>
@@ -201,6 +212,20 @@ export default function RecordingsPage() {
                   icon={<FileUp />}
                 ></Button>
               </Tooltip>
+
+              <Tooltip
+                content="Déposez un transcript WhisperX déjà existant (et, si vous en avez, un glossaire et un .ics). Il est corrigé puis ajouté à cette liste comme un enregistrement normal, sans audio."
+                placement="top"
+              >
+                <Button
+                  onClick={() => setOpenImportModal(true)}
+                  variant="bordered"
+                  color="neutral"
+                  icon={<DocMic />}
+                >
+                  Traiter un transcript
+                </Button>
+              </Tooltip>
             </div>
             <div className="recordings-actions__meta">
               <p className="recordings-actions__warning">
@@ -241,6 +266,10 @@ export default function RecordingsPage() {
           id: 'import-files',
           'aria-label': t('uploadInputAriaLabel'),
         })}
+      />
+      <ImportTranscriptModal
+        isOpen={openImportModal}
+        onClose={() => setOpenImportModal(false)}
       />
     </ConnectedLayout>
   )

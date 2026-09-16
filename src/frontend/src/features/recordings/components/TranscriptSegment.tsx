@@ -1,4 +1,5 @@
 import {
+  formatSpeaker,
   formatTimestamp,
   TranscriptViewSegment,
 } from '@/features/ai-jobs/utils/transcript.ts'
@@ -39,7 +40,7 @@ export function TranscriptSegment({
       aria-label={t('transcript.segmentSeekAriaLabel', {
         timestamp: segmentTimestamp,
         speaker: segment.speaker
-          ? `${t('transcript.speaker')} ${segment.speaker}`
+          ? formatSpeaker(segment.speaker, t('transcript.speaker'))
           : t('transcript.noSpeaker'),
       })}
       onDoubleClick={(event) => {
@@ -69,7 +70,8 @@ export function TranscriptSegment({
         <span className="transcript__intro">{segmentTimestamp}</span>
         {segment.speaker && (
           <span className={'transcript__intro'}>
-            &nbsp;{`· ${t('transcript.speaker')} ${segment.speaker}`}
+            &nbsp;
+            {`· ${formatSpeaker(segment.speaker, t('transcript.speaker'))}`}
           </span>
         )}
         &nbsp;

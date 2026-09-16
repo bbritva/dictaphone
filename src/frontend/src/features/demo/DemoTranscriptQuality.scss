@@ -289,3 +289,16 @@
     padding: 0 0 2rem;
   }
 }
+
+// "Traiter un transcript", inside a modal rather than on a page of its own.
+// The report it shows is the same one `/demo` shows, and it is long: the modal
+// body scrolls instead of growing past the viewport.
+.demo-import {
+  max-height: 70vh;
+  overflow-y: auto;
+  text-align: left;
+
+  .demo-drops {
+    margin-top: 1rem;
+  }
+}

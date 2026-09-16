@@ -265,6 +265,12 @@ class FileSourceChoices(models.TextChoices):
     WEB_FILE_UPLOAD = "web_file_upload", _("Web file upload")
     MOBILE_RECORDING = "mobile_recording", _("Mobile recording")
     MOBILE_FILE_UPLOAD = "mobile_file_upload", _("Mobile file upload")
+    # Demo-scoped: a recording whose transcript was handed to Dictaphone
+    # directly, with no audio behind it. It exists so a file that never had
+    # media can be told apart from one whose audio was deleted -- both carry
+    # `lifecycle_state = original_data_deleted`, and only this field says which
+    # of the two actually happened.
+    IMPORTED_TRANSCRIPT = "imported_transcript", _("Imported transcript")
 
 
 class File(BaseModel):

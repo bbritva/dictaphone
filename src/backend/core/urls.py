@@ -45,8 +45,8 @@ urlpatterns = [
                     name="download-mobile-app",
                 ),
                 # Demo-only. Proxies the summary service's own demo route.
-                # Neither of these writes anything: no File and no AiFileJob is
-                # created, updated or deleted by either.
+                # This one and the job-backed one below write nothing: no File
+                # and no AiFileJob is created, updated or deleted by either.
                 path(
                     "demo/transcript-quality/run/",
                     demo.run_transcript_quality_demo,
@@ -58,6 +58,14 @@ urlpatterns = [
                     "demo/transcript-quality/ai-jobs/<uuid:pk>/run/",
                     demo.run_transcript_quality_demo_on_job,
                     name="demo-transcript-quality-run-on-job",
+                ),
+                # Demo-only, and the one route here that keeps something:
+                # corrects an uploaded transcript and stores the result as a
+                # real recording. See `demo.import_transcript_as_recording`.
+                path(
+                    "demo/transcript-quality/import/",
+                    demo.import_transcript_as_recording,
+                    name="demo-transcript-quality-import",
                 ),
                 path(
                     "demo/transcript-quality/publish/",
