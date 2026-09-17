@@ -644,8 +644,14 @@ def store_summary(remote_job_id, url):
     ai_summary_job.save()
 
 
-def push_markdown_to_docs(
-    *, title, content, creator, send_notification_email=True, log_subject=None
+def push_markdown_to_docs(  # noqa: PLR0913  pylint: disable=too-many-arguments
+    *,
+    title,
+    content,
+    creator,
+    send_notification_email=True,
+    log_subject=None,
+    parent_id=None,
 ):
     """Create one document in Docs and return its id.
 
@@ -659,6 +665,11 @@ def push_markdown_to_docs(
     audio path, whose tests pin that message, and the document title for a
     caller that has no single file to name.
 
+    `parent_id` makes the new document a child of an existing Docs document
+    instead of a root, so several documents pushed for one recording show up in
+    the same sidebar tree. Left out of the request entirely when it is None, so
+    a caller that does not use it sends exactly the body it sent before.
+
     Returns:
         The Docs document id, or None when Docs took too long to answer. None
         is not a failure: Docs may well have created the document, so the
@@ -667,16 +678,20 @@ def push_markdown_to_docs(
     Raises:
         requests_lib.RequestException: Docs refused or could not be reached.
     """
+    body = {
+        "title": title,
+        "content": content,
+        "email": creator.email,
+        "sub": creator.sub,
+        "send_notification_email": send_notification_email,
+    }
+    if parent_id is not None:
+        body["parent_id"] = str(parent_id)
+
     try:
         response = session.post(
             urljoin(settings.DOCS_BASE_URL, "/api/v1.0/documents/create-for-owner/"),
-            json={
-                "title": title,
-                "content": content,
-                "email": creator.email,
-                "sub": creator.sub,
-                "send_notification_email": send_notification_email,
-            },
+            json=body,
             headers={
                 "Authorization": f"Bearer {settings.DOCS_SERVER_TO_SERVER_API_KEY}",
             },

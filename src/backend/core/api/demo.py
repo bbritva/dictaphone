@@ -111,6 +111,11 @@ DOC_RAW = "raw"
 DOC_CORRECTED = "corrected"
 DOC_SUMMARY = "summary"
 
+#: The document the three hang under in Docs' sidebar tree. It is deliberately
+#: not one of the three above: it carries no result, it is never returned in the
+#: `documents` list the modal renders, and the browser never keys on it.
+DOC_PARENT = "parent"
+
 
 def _summary_service_url(path):
     """Build a URL on the summary service from its configured base."""
@@ -443,7 +448,9 @@ def _docs_browser_url(docs_app_id):
     return urljoin(settings.DOCS_BASE_URL, f"docs/{docs_app_id}/")
 
 
-def _push_document(creator, *, kind, label, title, markdown, log_subject=None):
+def _push_document(
+    creator, *, kind, label, title, markdown, log_subject=None, parent_id=None
+):
     """Push one markdown to Docs and describe what happened, win or lose.
 
     Fails soft on purpose: the import creates three documents and the three are
@@ -451,6 +458,10 @@ def _push_document(creator, *, kind, label, title, markdown, log_subject=None):
     every outcome -- published, nothing to publish, Docs refused, Docs too slow
     -- comes back as a row the modal can show, and never as an exception that
     unwinds the whole import.
+
+    `parent_id` files the document under an existing Docs document instead of
+    creating another root. `None` is the old behaviour, and stays the fallback
+    when the parent itself could not be created.
 
     Returns:
         A dict with `kind`, `title`, `url` and `error`. Exactly one of `url`
@@ -470,6 +481,7 @@ def _push_document(creator, *, kind, label, title, markdown, log_subject=None):
             content=markdown,
             creator=creator,
             log_subject=log_subject,
+            parent_id=parent_id,
             # Three documents for one import would be three e-mails. The modal
             # hands back the three links directly, so the mail adds nothing.
             send_notification_email=False,
@@ -635,6 +647,30 @@ def import_transcript_as_recording(  # noqa: PLR0911  pylint: disable=too-many-r
     # raw text is a demo artefact, not the recording's transcript, so it lives
     # in Docs and nowhere else -- and that needs no new job type and no
     # migration.
+    #
+    # They are pushed under a parent document rather than as roots. Docs' left
+    # sidebar is a tree, and `create-for-owner` used to only ever make roots, so
+    # opening one of the documents of an import showed that document and nothing
+    # else: the other two were unreachable from it. The parent is what gives the
+    # import a tree to be listed in.
+    parent = _push_document(
+        request.user,
+        kind=DOC_PARENT,
+        log_subject=file.id,
+        label="Dossier de l'import",
+        # The recording's own title, unsuffixed: it names the set, the children
+        # name what each one is.
+        title=file.title[:255],
+        markdown=(
+            f"# {file.title}\n\n"
+            "Les documents produits à partir de cet enregistrement sont "
+            "classés sous celui-ci."
+        ),
+    )
+    # Fail-soft, like every other push here: if the parent could not be created
+    # the three documents are still published, as roots, exactly as before.
+    parent_id = parent["docs_app_id"]
+
     documents = [
         _push_document(
             request.user,
@@ -643,6 +679,7 @@ def import_transcript_as_recording(  # noqa: PLR0911  pylint: disable=too-many-r
             label="Transcript brut",
             title=f"{file.title} — transcript brut"[:255],
             markdown=(payload.get("before") or {}).get("markdown"),
+            parent_id=parent_id,
         )
     ]
 
@@ -653,6 +690,7 @@ def import_transcript_as_recording(  # noqa: PLR0911  pylint: disable=too-many-r
         label="Transcript corrigé",
         title=f"{file.title} — transcript corrigé"[:255],
         markdown=(payload.get("after") or {}).get("markdown"),
+        parent_id=parent_id,
     )
     # Carried on the job, so "Ouvrir dans Docs" on the recording page opens
     # this very document instead of creating a fourth one.
@@ -904,6 +942,15 @@ def summarize_imported_recording(  # noqa: PLR0911  pylint: disable=too-many-ret
 
     # Rendered by the model, not here: `to_markdown` is what the recording
     # page's own "ouvrir dans Docs" would have produced for a summary job.
+    #
+    # Pushed as a root, unlike the two transcript documents of the import. This
+    # is a separate request, minutes later, and the parent created back then is
+    # not recoverable here: the only Docs id this flow persists is
+    # `AiFileJob.docs_app_id`, the corrected document, and the single Docs route
+    # this codebase is allowed to call with the server-to-server key is
+    # `create-for-owner`. There is no route that answers "what is the parent of
+    # this document" for a server key, so the id would have to be stored --
+    # which needs a migration. Left at root on purpose rather than guessed.
     document = _push_document(
         request.user,
         kind=DOC_SUMMARY,

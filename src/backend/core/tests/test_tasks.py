@@ -26,6 +26,7 @@ from core.tasks.file import (
     handle_transcript_received,
     process_file_deletion,
     process_original_file_data_deletion,
+    push_markdown_to_docs,
     store_summary,
 )
 from core.tasks.retry import build_retry_task_options
@@ -842,3 +843,58 @@ def test_task_call_transcribe_service_retries_on_request_error(mock_post, settin
     _, kwargs = mock_retry.call_args
     assert isinstance(kwargs["exc"], requests.HTTPError)
     assert kwargs["max_retries"] == settings.CELERY_TASK_RETRY_MAX_RETRIES
+
+
+@patch("core.tasks.file.session.post")
+def test_push_markdown_to_docs_omits_parent_id_by_default(mock_post, settings):
+    """Without a parent, the body must be exactly the one sent before parents existed."""
+    settings.DOCS_BASE_URL = "https://docs.example.com"
+    settings.DOCS_SERVER_TO_SERVER_API_KEY = "docs-api-key"
+    user = factories.UserFactory()
+
+    response = Mock()
+    response.status_code = 201
+    response.json.return_value = {"id": "new-doc-id"}
+    mock_post.return_value = response
+
+    assert (
+        push_markdown_to_docs(title="Title", content="# Body", creator=user)
+        == "new-doc-id"
+    )
+
+    mock_post.assert_called_once_with(
+        "https://docs.example.com/api/v1.0/documents/create-for-owner/",
+        json={
+            "title": "Title",
+            "content": "# Body",
+            "email": user.email,
+            "sub": user.sub,
+            "send_notification_email": True,
+        },
+        headers={"Authorization": "Bearer docs-api-key"},
+        timeout=(20, 3 * 60),
+    )
+
+
+@patch("core.tasks.file.session.post")
+def test_push_markdown_to_docs_sends_parent_id(mock_post, settings):
+    """With a parent, and only then, the body carries it as a string."""
+    settings.DOCS_BASE_URL = "https://docs.example.com"
+    settings.DOCS_SERVER_TO_SERVER_API_KEY = "docs-api-key"
+    user = factories.UserFactory()
+    parent_id = uuid4()
+
+    response = Mock()
+    response.status_code = 201
+    response.json.return_value = {"id": "child-doc-id"}
+    mock_post.return_value = response
+
+    assert (
+        push_markdown_to_docs(
+            title="Title", content="# Body", creator=user, parent_id=parent_id
+        )
+        == "child-doc-id"
+    )
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"]["parent_id"] == str(parent_id)
