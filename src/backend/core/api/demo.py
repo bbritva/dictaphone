@@ -466,7 +466,7 @@ def _parent_id_of(request):
         A `(parent_id, error_response)` pair; at most one is set. Both are None
         when the field was not sent, which is the supported old call.
     """
-    raw = request.data.get("parent_id")
+    raw = request.data.get("parent_document_id")
     if raw is None:
         return None, None
 
@@ -474,7 +474,7 @@ def _parent_id_of(request):
         return str(UUID(str(raw))), None
     except (AttributeError, TypeError, ValueError):
         return None, Response(
-            {"error": "« parent_id » n'est pas un identifiant de document valide."},
+            {"error": "« parent_document_id » n'est pas un identifiant de document valide."},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -838,7 +838,7 @@ def summarize_imported_recording(  # noqa: PLR0911  pylint: disable=too-many-ret
     path: the job created below is the same `summary` job the audio path
     creates, made with the same request against the same route.
 
-    Takes an optional `parent_id` in the body: the Docs document the import
+    Takes an optional `parent_document_id` in the body: the Docs document the import
     created for this recording, handed back by the browser because nothing on
     the server remembers it. Omitting it is a supported call, not a degraded
     one -- the compte-rendu is then published as a root document, which is what

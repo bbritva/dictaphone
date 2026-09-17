@@ -686,7 +686,7 @@ def push_markdown_to_docs(  # noqa: PLR0913  pylint: disable=too-many-arguments
         "send_notification_email": send_notification_email,
     }
     if parent_id is not None:
-        body["parent_id"] = str(parent_id)
+        body["parent_document_id"] = str(parent_id)
 
     try:
         response = session.post(

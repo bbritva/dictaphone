@@ -232,7 +232,7 @@ export const summarizeImported = (
       // before parents existed. Inventing an id here would be worse than not
       // sending one.
       body: JSON.stringify(
-        parentDocumentId ? { parent_id: parentDocumentId } : {}
+        parentDocumentId ? { parent_document_id: parentDocumentId } : {}
       ),
       headers: { 'Content-Type': 'application/json' },
     }

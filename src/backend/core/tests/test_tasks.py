@@ -897,4 +897,4 @@ def test_push_markdown_to_docs_sends_parent_id(mock_post, settings):
     )
 
     _, kwargs = mock_post.call_args
-    assert kwargs["json"]["parent_id"] == str(parent_id)
+    assert kwargs["json"]["parent_document_id"] == str(parent_id)

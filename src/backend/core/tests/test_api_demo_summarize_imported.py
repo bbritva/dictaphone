@@ -94,7 +94,7 @@ def test_api_demo_summarize_imported_publishes_under_the_given_parent(
 
     response = client.post(
         SUMMARIZE_URL.format(pk=ai_job.id),
-        {"parent_id": parent_id},
+        {"parent_document_id": parent_id},
         format="json",
     )
 
@@ -135,7 +135,7 @@ def test_api_demo_summarize_imported_accepts_an_explicit_null_parent(
     client.force_login(user)
 
     response = client.post(
-        SUMMARIZE_URL.format(pk=ai_job.id), {"parent_id": None}, format="json"
+        SUMMARIZE_URL.format(pk=ai_job.id), {"parent_document_id": None}, format="json"
     )
 
     assert response.status_code == status.HTTP_201_CREATED
@@ -151,13 +151,13 @@ def test_api_demo_summarize_imported_rejects_a_malformed_parent(imported, pipeli
 
     response = client.post(
         SUMMARIZE_URL.format(pk=ai_job.id),
-        {"parent_id": "not-a-uuid"},
+        {"parent_document_id": "not-a-uuid"},
         format="json",
     )
 
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert response.json() == {
-        "error": "« parent_id » n'est pas un identifiant de document valide."
+        "error": "« parent_document_id » n'est pas un identifiant de document valide."
     }
 
     pipeline.assert_not_called()
