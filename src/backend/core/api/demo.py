@@ -47,6 +47,7 @@ import logging
 from os.path import splitext
 from time import monotonic, sleep
 from urllib.parse import urljoin
+from uuid import UUID
 
 from django.conf import settings
 from django.http import Http404
@@ -448,6 +449,36 @@ def _docs_browser_url(docs_app_id):
     return urljoin(settings.DOCS_BASE_URL, f"docs/{docs_app_id}/")
 
 
+def _parent_id_of(request):
+    """Read the optional Docs parent id a client sends back on a later call.
+
+    The import creates the parent and hands its id to the browser; nothing on
+    the server stores it. A client that has it sends it back, a client that
+    never had it -- an older one, or one summarising an import from another
+    session -- leaves the field out, and gets the root document it has always
+    got.
+
+    Only the shape is checked. The id names a document in Docs, not one of ours,
+    and Docs refuses any parent the named user is not owner or admin of, so a
+    tampered value cannot reach a document the caller has no rights on.
+
+    Returns:
+        A `(parent_id, error_response)` pair; at most one is set. Both are None
+        when the field was not sent, which is the supported old call.
+    """
+    raw = request.data.get("parent_id")
+    if raw is None:
+        return None, None
+
+    try:
+        return str(UUID(str(raw))), None
+    except (AttributeError, TypeError, ValueError):
+        return None, Response(
+            {"error": "« parent_id » n'est pas un identifiant de document valide."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 def _push_document(
     creator, *, kind, label, title, markdown, log_subject=None, parent_id=None
 ):
@@ -713,6 +744,13 @@ def import_transcript_as_recording(  # noqa: PLR0911  pylint: disable=too-many-r
             # the two documents that already exist hostage to it. The modal
             # asks for it on the next call.
             "documents": documents,
+            # Not a row of `documents`: that list is what the modal renders,
+            # one line per result, and the parent carries no result of its own.
+            # It is here so the browser can hand it back on the summarize call
+            # -- the only way that later request can learn where this import's
+            # tree is. None when the parent push failed and the two documents
+            # above went to the root instead.
+            "parent_document_id": parent_id,
         },
         status=status.HTTP_201_CREATED,
     )
@@ -799,6 +837,12 @@ def summarize_imported_recording(  # noqa: PLR0911  pylint: disable=too-many-ret
     compte-rendu from the ordinary pipeline, and nothing here touches that
     path: the job created below is the same `summary` job the audio path
     creates, made with the same request against the same route.
+
+    Takes an optional `parent_id` in the body: the Docs document the import
+    created for this recording, handed back by the browser because nothing on
+    the server remembers it. Omitting it is a supported call, not a degraded
+    one -- the compte-rendu is then published as a root document, which is what
+    every client did before the field existed.
     """
     ai_job = get_object_or_404(
         AiFileJob.objects.select_related("file", "file__creator"), pk=pk
@@ -824,6 +868,18 @@ def summarize_imported_recording(  # noqa: PLR0911  pylint: disable=too-many-ret
             },
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    # Checked here, before anything is created or any model is called: a
+    # malformed value must cost nothing.
+    #
+    # Shape is all we check. We do not verify that this id is the parent this
+    # import actually created, and we do not need to: Docs refuses any parent
+    # the named user is not owner or admin of. That is the bound we rely on --
+    # the worst a tampered value buys the caller is filing their own
+    # compte-rendu under another of their own documents.
+    parent_id, error = _parent_id_of(request)
+    if error is not None:
+        return error
 
     # A double click must not buy a second document.
     already = (
@@ -943,14 +999,16 @@ def summarize_imported_recording(  # noqa: PLR0911  pylint: disable=too-many-ret
     # Rendered by the model, not here: `to_markdown` is what the recording
     # page's own "ouvrir dans Docs" would have produced for a summary job.
     #
-    # Pushed as a root, unlike the two transcript documents of the import. This
-    # is a separate request, minutes later, and the parent created back then is
-    # not recoverable here: the only Docs id this flow persists is
-    # `AiFileJob.docs_app_id`, the corrected document, and the single Docs route
-    # this codebase is allowed to call with the server-to-server key is
-    # `create-for-owner`. There is no route that answers "what is the parent of
-    # this document" for a server key, so the id would have to be stored --
-    # which needs a migration. Left at root on purpose rather than guessed.
+    # Filed under the import's parent when the caller sent one, so the three
+    # documents of one import sit in the same tree. The id comes from the
+    # browser rather than from here: this is a separate request, minutes after
+    # the import, and nothing on the server remembers the parent. The only Docs
+    # id this flow persists is `AiFileJob.docs_app_id`, the corrected document,
+    # and the one Docs route the server-to-server key opens is
+    # `create-for-owner` -- there is no route that answers "what is the parent
+    # of this document". Storing it would have meant a migration; sending it
+    # back does not. A caller that has no parent id gets a root document, as
+    # before.
     document = _push_document(
         request.user,
         kind=DOC_SUMMARY,
@@ -958,6 +1016,7 @@ def summarize_imported_recording(  # noqa: PLR0911  pylint: disable=too-many-ret
         log_subject=file.id,
         title=f"{file.title} — compte-rendu"[:255],
         markdown=summary_job.to_markdown(file.creator.language),
+        parent_id=parent_id,
     )
     if document["docs_app_id"]:
         summary_job.docs_app_id = document["docs_app_id"]

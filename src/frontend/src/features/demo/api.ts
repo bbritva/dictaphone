@@ -174,6 +174,12 @@ export interface DemoImported extends DemoReport {
   // call, because it is another minutes-long model round trip and the two
   // links must not wait for it.
   documents: DemoDocument[]
+  // The Docs document the two above were filed under. Not one of `documents`:
+  // it carries no result, so the modal has no row for it. It is here to be
+  // handed straight back on the summarize call, which is the only way that
+  // later request can put the compte-rendu in the same tree. `null` when the
+  // parent could not be created and the two documents went to the root.
+  parent_document_id: string | null
 }
 
 /**
@@ -210,12 +216,26 @@ export const importTranscript = (input: {
  * Deliberately after `importTranscript` rather than inside it: the two
  * transcript documents exist as soon as the correction is done and are shown
  * then, while this one runs behind a pending row. Called with the transcript
- * job's id, the one `importTranscript` hands back.
+ * job's id, the one `importTranscript` hands back, and with the parent document
+ * of that same import so the compte-rendu joins the other two in Docs' tree
+ * instead of becoming a third root.
  */
-export const summarizeImported = (aiJobId: string) =>
+export const summarizeImported = (
+  aiJobId: string,
+  parentDocumentId: string | null
+) =>
   post<{ document: DemoDocument }>(
     `demo/transcript-quality/ai-jobs/${aiJobId}/summarize/`,
-    { headers: { 'Content-Type': 'application/json' } }
+    {
+      // Omitted, not sent as null, when there is no parent: the server treats a
+      // missing field as "publish at the root", which is what every client did
+      // before parents existed. Inventing an id here would be worse than not
+      // sending one.
+      body: JSON.stringify(
+        parentDocumentId ? { parent_id: parentDocumentId } : {}
+      ),
+      headers: { 'Content-Type': 'application/json' },
+    }
   )
 
 export const publishDemo = (runId: string, which: 'before' | 'after') =>

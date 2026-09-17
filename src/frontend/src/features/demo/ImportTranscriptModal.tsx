@@ -163,7 +163,10 @@ export function ImportTranscriptModal({
     // screen while it runs.
     setIsSummarizing(true)
     try {
-      const { document } = await summarizeImported(imported.file.ai_job_id)
+      const { document } = await summarizeImported(
+        imported.file.ai_job_id,
+        imported.parent_document_id
+      )
       setSummary(document)
     } catch (exception) {
       setSummary({
