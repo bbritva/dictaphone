@@ -1,5 +1,6 @@
 """Tests for background tasks."""
 
+import logging
 from io import BytesIO
 from unittest.mock import Mock, patch
 from uuid import uuid4
@@ -8,7 +9,7 @@ from django.core.files.storage import default_storage
 
 import pytest
 import requests
-from celery.exceptions import Retry
+from celery.exceptions import MaxRetriesExceededError, Retry
 
 from core import factories
 from core.models import (
@@ -23,6 +24,7 @@ from core.tasks.file import (
     DocumentCreationAlreadyInProgress,
     call_transcribe_service,
     create_document_in_docs,
+    create_summary_document_in_docs,
     handle_transcript_received,
     process_file_deletion,
     process_original_file_data_deletion,
@@ -513,8 +515,9 @@ def test_task_store_summary_ignores_non_summary_job(mock_get):
     mock_get.assert_not_called()
 
 
+@patch("core.tasks.file.create_summary_document_in_docs.apply_async")
 @patch("core.tasks.file.session.get")
-def test_task_store_summary_success(mock_get):
+def test_task_store_summary_success(mock_get, mock_create_summary_document):
     """Summary should be stored and summary job marked success."""
     ai_summary_job = factories.AiFileJobFactory(
         type=AiJobTypeChoices.SUMMARIZE,
@@ -546,10 +549,12 @@ def test_task_store_summary_success(mock_get):
 
     ai_summary_job.refresh_from_db()
     assert ai_summary_job.status == AiJobStatusChoices.SUCCESS
+    mock_create_summary_document.assert_called_once_with(args=[ai_summary_job.id])
 
 
+@patch("core.tasks.file.create_summary_document_in_docs.apply_async")
 @patch("core.tasks.file.session.get")
-def test_task_store_summary_get_error(mock_get):
+def test_task_store_summary_get_error(mock_get, mock_create_summary_document):
     """If summary download fails, nothing should be persisted."""
     ai_summary_job = factories.AiFileJobFactory(
         type=AiJobTypeChoices.SUMMARIZE,
@@ -568,6 +573,7 @@ def test_task_store_summary_get_error(mock_get):
     ai_summary_job.refresh_from_db()
     assert ai_summary_job.status == AiJobStatusChoices.PENDING
     assert not default_storage.exists(f"summaries/{ai_summary_job.id!s}.txt")
+    mock_create_summary_document.assert_not_called()
 
 
 @patch("core.tasks.file.create_document_in_docs.apply_async")
@@ -792,6 +798,7 @@ def test_build_retry_task_options_uses_settings(settings):
         handle_transcript_received,
         store_summary,
         create_document_in_docs,
+        create_summary_document_in_docs,
     ],
 )
 def test_network_tasks_share_retry_configuration(task, settings):
@@ -810,6 +817,7 @@ def test_network_tasks_do_not_share_mutable_retry_state():
         handle_transcript_received,
         store_summary,
         create_document_in_docs,
+        create_summary_document_in_docs,
     )
 
     assert len({id(task.retry_kwargs) for task in tasks}) == len(tasks)
@@ -898,3 +906,328 @@ def test_push_markdown_to_docs_sends_parent_id(mock_post, settings):
 
     _, kwargs = mock_post.call_args
     assert kwargs["json"]["parent_document_id"] == str(parent_id)
+
+
+def _docs_response(document_id):
+    """Build a successful `create-for-owner` response."""
+    response = Mock()
+    response.status_code = 201
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"id": document_id}
+    return response
+
+
+def _configure_docs(settings):
+    """Point the Docs client at a fake server."""
+    settings.DOCS_BASE_URL = "https://docs.example.com"
+    settings.DOCS_SERVER_TO_SERVER_API_KEY = "docs-api-key"
+
+
+def _recording_jobs(**transcript_kwargs):
+    """Create one file with a successful transcript job and a summary job."""
+    file = factories.FileFactory(upload_bytes=b"hello", title="Meeting notes")
+    transcript_job = factories.AiFileJobFactory(
+        file=file,
+        type=AiJobTypeChoices.TRANSCRIPT,
+        status=AiJobStatusChoices.SUCCESS,
+        **transcript_kwargs,
+    )
+    summary_job = factories.AiFileJobFactory(
+        file=file,
+        type=AiJobTypeChoices.SUMMARIZE,
+        status=AiJobStatusChoices.SUCCESS,
+        docs_app_id=None,
+    )
+    return transcript_job, summary_job
+
+
+@pytest.mark.parametrize("auto_create_in_docs", [True, False])
+@patch("core.tasks.file.create_summary_document_in_docs.apply_async")
+@patch("core.tasks.file.session.get")
+def test_task_store_summary_honors_the_docs_policy(
+    mock_get, mock_create_summary_document, settings, auto_create_in_docs
+):
+    """A successful summary should be published to Docs behind the same flag."""
+    settings.DATA_POLICY_CONFIGURATIONS = {
+        "default": {"default": True, "auto_create_in_docs": auto_create_in_docs}
+    }
+    ai_summary_job = factories.AiFileJobFactory(
+        type=AiJobTypeChoices.SUMMARIZE,
+        status=AiJobStatusChoices.PENDING,
+    )
+    get_response = Mock()
+    get_response.raise_for_status.return_value = None
+    get_response.content = b"Summary content"
+    mock_get.return_value = get_response
+
+    store_summary(
+        remote_job_id=ai_summary_job.remote_job_id,
+        url="http://example.com/summary.txt",
+    )
+
+    if auto_create_in_docs:
+        mock_create_summary_document.assert_called_once_with(args=[ai_summary_job.id])
+    else:
+        mock_create_summary_document.assert_not_called()
+
+
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_ignores_non_summary_job(mock_post):
+    """Only summary jobs go through the summary publication."""
+    ai_transcript_job = factories.AiFileJobFactory(type=AiJobTypeChoices.TRANSCRIPT)
+
+    create_summary_document_in_docs(ai_transcript_job.id)
+
+    mock_post.assert_not_called()
+
+
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_ignores_existing_doc(mock_post):
+    """A summary already published must not be published a second time."""
+    ai_summary_job = factories.AiFileJobFactory(
+        type=AiJobTypeChoices.SUMMARIZE,
+        docs_app_id="existing-doc-id",
+    )
+
+    create_summary_document_in_docs(ai_summary_job.id)
+
+    mock_post.assert_not_called()
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", return_value="# Body")
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_under_transcript_document(
+    mock_post, _mock_to_markdown, settings
+):
+    """The summary document is a child of the transcript document."""
+    _configure_docs(settings)
+    transcript_job, summary_job = _recording_jobs(docs_app_id="transcript-doc-id")
+    mock_post.return_value = _docs_response("summary-doc-id")
+
+    create_summary_document_in_docs(summary_job.id)
+
+    mock_post.assert_called_once()
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"]["parent_document_id"] == "transcript-doc-id"
+    assert kwargs["json"]["title"] == "Meeting notes — compte-rendu"
+
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id == "summary-doc-id"
+    assert summary_job.docs_creation_in_progress is False
+    transcript_job.refresh_from_db()
+    assert transcript_job.docs_app_id == "transcript-doc-id"
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", return_value="# Body")
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_at_root_without_transcript_job(
+    mock_post, _mock_to_markdown, settings, caplog
+):
+    """With no transcript job at all, the summary is published at the root."""
+    _configure_docs(settings)
+    summary_job = factories.AiFileJobFactory(
+        type=AiJobTypeChoices.SUMMARIZE,
+        status=AiJobStatusChoices.SUCCESS,
+        docs_app_id=None,
+    )
+    mock_post.return_value = _docs_response("summary-doc-id")
+
+    with caplog.at_level(logging.WARNING):
+        create_summary_document_in_docs(summary_job.id)
+
+    mock_post.assert_called_once()
+    _, kwargs = mock_post.call_args
+    assert "parent_document_id" not in kwargs["json"]
+    assert "at the root" in caplog.text
+
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id == "summary-doc-id"
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", return_value="# Body")
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_at_root_when_transcript_push_times_out(
+    mock_post, _mock_to_markdown, settings, caplog
+):
+    """A timeout on the transcript push leaves no parent and persists no id."""
+    _configure_docs(settings)
+    transcript_job, summary_job = _recording_jobs(docs_app_id=None)
+    mock_post.side_effect = [
+        requests.ReadTimeout("docs is slow"),
+        _docs_response("summary-doc-id"),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        create_summary_document_in_docs(summary_job.id)
+
+    assert mock_post.call_count == 2
+    _, kwargs = mock_post.call_args
+    assert "parent_document_id" not in kwargs["json"]
+    assert "at the root" in caplog.text
+
+    transcript_job.refresh_from_db()
+    assert transcript_job.docs_app_id is None
+    assert transcript_job.docs_creation_in_progress is False
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id == "summary-doc-id"
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", return_value="# Body")
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_at_root_when_transcript_push_fails(
+    mock_post, _mock_to_markdown, settings
+):
+    """Docs refusing the transcript must not cost us the summary document."""
+    _configure_docs(settings)
+    refused = Mock()
+    refused.status_code = 500
+    refused.text = "boom"
+    refused.raise_for_status.side_effect = requests.HTTPError("boom")
+    transcript_job, summary_job = _recording_jobs(docs_app_id=None)
+    mock_post.side_effect = [refused, _docs_response("summary-doc-id")]
+
+    create_summary_document_in_docs(summary_job.id)
+
+    assert mock_post.call_count == 2
+    _, kwargs = mock_post.call_args
+    assert "parent_document_id" not in kwargs["json"]
+
+    transcript_job.refresh_from_db()
+    assert transcript_job.docs_app_id is None
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id == "summary-doc-id"
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", return_value="# Body")
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_does_not_persist_a_timed_out_id(
+    mock_post, _mock_to_markdown, settings
+):
+    """A timeout on the summary push persists nothing and releases the claim."""
+    _configure_docs(settings)
+    _transcript_job, summary_job = _recording_jobs(docs_app_id="transcript-doc-id")
+    mock_post.side_effect = requests.ReadTimeout("docs is slow")
+
+    create_summary_document_in_docs(summary_job.id)
+
+    mock_post.assert_called_once()
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id is None
+    assert summary_job.docs_creation_in_progress is False
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", return_value="# Body")
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_waits_for_a_held_transcript_claim(
+    mock_post, _mock_to_markdown, settings
+):
+    """While another worker publishes the transcript, nothing is pushed here."""
+    _configure_docs(settings)
+    transcript_job, summary_job = _recording_jobs(
+        docs_app_id=None,
+        docs_creation_in_progress=True,
+    )
+
+    with patch.object(
+        create_summary_document_in_docs, "retry", side_effect=Retry()
+    ) as mock_retry:
+        with pytest.raises(Retry):
+            create_summary_document_in_docs(summary_job.id)
+
+    # Nothing was published, so the retry cannot duplicate anything.
+    mock_post.assert_not_called()
+    _, kwargs = mock_retry.call_args
+    assert isinstance(kwargs["exc"], DocumentCreationAlreadyInProgress)
+
+    transcript_job.refresh_from_db()
+    assert transcript_job.docs_app_id is None
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id is None
+    assert summary_job.docs_creation_in_progress is False
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", return_value="# Body")
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_at_root_when_the_claim_never_releases(
+    mock_post, _mock_to_markdown, settings, caplog
+):
+    """Retries exhausted on a held claim: the summary still gets published."""
+    _configure_docs(settings)
+    transcript_job, summary_job = _recording_jobs(
+        docs_app_id=None,
+        docs_creation_in_progress=True,
+    )
+    mock_post.return_value = _docs_response("summary-doc-id")
+
+    with patch.object(
+        create_summary_document_in_docs,
+        "retry",
+        side_effect=MaxRetriesExceededError(),
+    ):
+        with caplog.at_level(logging.WARNING):
+            create_summary_document_in_docs(summary_job.id)
+
+    # Exactly one document was pushed, and it is the summary: the transcript
+    # document belongs to the worker holding the claim.
+    mock_post.assert_called_once()
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"]["title"] == "Meeting notes — compte-rendu"
+    assert "parent_document_id" not in kwargs["json"]
+    assert "at the root" in caplog.text
+
+    transcript_job.refresh_from_db()
+    assert transcript_job.docs_app_id is None
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id == "summary-doc-id"
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", return_value="# Body")
+@patch("core.tasks.file.session.post")
+def test_task_one_transcript_document_when_both_publishes_run(
+    mock_post, _mock_to_markdown, settings
+):
+    """The summary overtaking the transcript still yields ONE transcript document."""
+    _configure_docs(settings)
+    transcript_job, summary_job = _recording_jobs(docs_app_id=None)
+    mock_post.side_effect = [
+        _docs_response("transcript-doc-id"),
+        _docs_response("summary-doc-id"),
+    ]
+
+    # The summary publish runs first and creates the missing parent itself.
+    create_summary_document_in_docs(summary_job.id)
+    # The transcript's own queued publish arrives late: it must push nothing.
+    create_document_in_docs(transcript_job.id)
+
+    assert mock_post.call_count == 2
+    first_body = mock_post.call_args_list[0][1]["json"]
+    second_body = mock_post.call_args_list[1][1]["json"]
+    assert first_body["title"] == "Meeting notes"
+    assert "parent_document_id" not in first_body
+    assert second_body["title"] == "Meeting notes — compte-rendu"
+    assert second_body["parent_document_id"] == "transcript-doc-id"
+
+    transcript_job.refresh_from_db()
+    assert transcript_job.docs_app_id == "transcript-doc-id"
+    assert transcript_job.docs_creation_in_progress is False
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id == "summary-doc-id"
+    assert summary_job.docs_creation_in_progress is False
+
+
+@patch("core.tasks.file.AiFileJob.to_markdown", side_effect=OSError("storage is down"))
+@patch("core.tasks.file.session.post")
+def test_task_create_summary_document_releases_no_claim_on_a_read_failure(
+    mock_post, _mock_to_markdown, settings
+):
+    """A failure to read the summary must leave the job publishable later."""
+    _configure_docs(settings)
+    _transcript_job, summary_job = _recording_jobs(docs_app_id="transcript-doc-id")
+
+    with pytest.raises(OSError, match="storage is down"):
+        create_summary_document_in_docs(summary_job.id)
+
+    mock_post.assert_not_called()
+    summary_job.refresh_from_db()
+    assert summary_job.docs_app_id is None
+    assert summary_job.docs_creation_in_progress is False

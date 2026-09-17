@@ -12,6 +12,7 @@ from django.conf import settings
 from django.utils import timezone
 
 import requests as requests_lib
+from celery.exceptions import MaxRetriesExceededError
 
 from core import analytics
 from core.audio import (
@@ -643,6 +644,12 @@ def store_summary(remote_job_id, url):
     ai_summary_job.status = AiJobStatusChoices.SUCCESS
     ai_summary_job.save()
 
+    # Published without waiting to be asked, behind the same profile flag as
+    # the transcript: one policy for "this recording goes to Docs", not two.
+    profile = get_profile_for_email(file.creator.email)
+    if profile.auto_create_in_docs:
+        create_summary_document_in_docs.apply_async(args=[ai_summary_job.id])
+
 
 def push_markdown_to_docs(  # noqa: PLR0913  pylint: disable=too-many-arguments
     *,
@@ -712,6 +719,30 @@ def push_markdown_to_docs(  # noqa: PLR0913  pylint: disable=too-many-arguments
     return response.json()["id"]
 
 
+def _claim_docs_creation(ai_job) -> bool:
+    """Take the exclusive right to publish `ai_job` to Docs.
+
+    One conditional UPDATE, so reading the state and taking the claim are a
+    single atomic statement: the database locks the row for the duration of
+    the UPDATE and reports how many rows matched, so exactly one of several
+    concurrent workers gets 1 back and the others get 0. Preferred here over
+    `select_for_update()` inside `transaction.atomic()` because the Docs call
+    that follows the claim can take three minutes, and a row lock held across
+    it would hold a transaction open for just as long.
+
+    Returns:
+        True when this caller now owns the claim, False when someone else
+        already owns it or the document already exists.
+    """
+    return bool(
+        AiFileJob.objects.filter(
+            pk=ai_job.pk,
+            docs_app_id__isnull=True,
+            docs_creation_in_progress=False,
+        ).update(docs_creation_in_progress=True)
+    )
+
+
 @app.task(
     queue=BACKEND_QUEUE,
     **build_retry_task_options(autoretry_for=(requests_lib.RequestException,)),
@@ -731,12 +762,7 @@ def create_document_in_docs(ai_job_id):
         logger.info("Document already exists in Docs for file %s", ai_job.file.id)
         return
 
-    claimed = AiFileJob.objects.filter(
-        pk=ai_job.pk,
-        docs_app_id__isnull=True,
-        docs_creation_in_progress=False,
-    ).update(docs_creation_in_progress=True)
-    if not claimed:
+    if not _claim_docs_creation(ai_job):
         raise DocumentCreationAlreadyInProgress(
             f"Document creation is already in progress for AI job {ai_job.id}"
         )
@@ -770,6 +796,172 @@ def create_document_in_docs(ai_job_id):
     except requests_lib.RequestException:
         AiFileJob.objects.filter(pk=ai_job.pk).update(docs_creation_in_progress=False)
         raise
+    finally:
+        AiFileJob.objects.filter(pk=ai_job.pk).update(
+            docs_creation_in_progress=False,
+        )
+
+
+def _find_transcript_job(summary_job):
+    """Return the transcript job a summary job was derived from, or None.
+
+    A pure read: it creates nothing and pushes nothing. The link is not stored
+    on the row -- storing it would be a migration -- so it is rebuilt from the
+    file: the last transcript that succeeded before this summary was created.
+    """
+    return (
+        AiFileJob.objects.filter(
+            file_id=summary_job.file_id,
+            type=AiJobTypeChoices.TRANSCRIPT,
+            status=AiJobStatusChoices.SUCCESS,
+            created_at__lte=summary_job.created_at,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+
+
+def _ensure_transcript_document_id(transcript_job):
+    """Return the id of the transcript document, publishing it if it is missing.
+
+    An explicit step, deliberately not folded into building the request body:
+    it is the only place on the summary path that may write to Docs for a job
+    other than the one being published, and that is worth seeing at the call
+    site.
+
+    The transcript publish is queued with `apply_async`, so a summary publish
+    can genuinely overtake it and find no parent yet. Publishing the transcript
+    here goes through `create_document_in_docs`, which takes the same atomic
+    claim as the transcript's own task: whichever of the two runs first
+    creates the document, the other is refused. That is what keeps one
+    recording to one transcript document.
+
+    Returns:
+        The Docs id of the transcript document, or None when it could not be
+        obtained -- Docs timed out, Docs refused, the transcript result could
+        not be read. None means "no parent available", never "fail": the
+        summary document matters more than its position in the tree.
+
+    Raises:
+        DocumentCreationAlreadyInProgress: another worker owns the claim and
+            is creating the transcript document right now. The only case the
+            caller can usefully wait for, so it is the only one raised.
+    """
+    if transcript_job.docs_app_id:
+        return transcript_job.docs_app_id
+
+    try:
+        create_document_in_docs(transcript_job.id)
+    except DocumentCreationAlreadyInProgress:
+        raise
+    # Deliberately wide: a missing parent must never cost us the summary.
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception(
+            "Could not create the transcript document for file %s",
+            transcript_job.file_id,
+        )
+        return None
+
+    transcript_job.refresh_from_db(fields=["docs_app_id"])
+    # Still None when Docs timed out: the document probably exists but its id
+    # is lost, and asking again would create a second one.
+    return transcript_job.docs_app_id
+
+
+@app.task(
+    bind=True,
+    queue=BACKEND_QUEUE,
+    **build_retry_task_options(autoretry_for=(requests_lib.RequestException,)),
+)
+def create_summary_document_in_docs(self, ai_job_id):
+    """Create the summary document in Docs, under the transcript document.
+
+    Same shape as `create_document_in_docs`, same claim, one step more: the
+    parent is resolved first, and every way of failing to resolve it ends with
+    the summary published at the root rather than not published at all.
+    """
+    ai_job = (
+        AiFileJob.objects.select_related("file", "file__creator")
+        .filter(pk=ai_job_id)
+        .first()
+    )
+    if ai_job is None or ai_job.type != AiJobTypeChoices.SUMMARIZE:
+        logger.warning("No AI summary job found for job ID: %s", ai_job_id)
+        return
+
+    if ai_job.docs_app_id is not None:
+        logger.info(
+            "Summary document already exists in Docs for file %s", ai_job.file.id
+        )
+        return
+
+    parent_document_id = None
+    transcript_job = _find_transcript_job(ai_job)
+    if transcript_job is None:
+        logger.warning("No successful transcript job found for file %s", ai_job.file.id)
+    else:
+        try:
+            parent_document_id = _ensure_transcript_document_id(transcript_job)
+        except DocumentCreationAlreadyInProgress as exc:
+            # The one case worth waiting for instead of degrading: another
+            # worker is publishing the transcript right now, so the id exists
+            # in seconds, and nothing has been published here yet -- the claim
+            # below is not taken, so a retry cannot produce a second summary
+            # document. Every other way of losing the parent is permanent for
+            # this run, so it degrades to the root immediately.
+            try:
+                self.retry(exc=exc, max_retries=settings.CELERY_TASK_RETRY_MAX_RETRIES)
+            except MaxRetriesExceededError:
+                logger.warning(
+                    "Transcript document for file %s is still being created after "
+                    "%s attempts",
+                    ai_job.file.id,
+                    settings.CELERY_TASK_RETRY_MAX_RETRIES,
+                )
+
+    if parent_document_id is None:
+        logger.warning(
+            "Publishing the summary of file %s at the root: "
+            "no transcript document is available to be its parent",
+            ai_job.file.id,
+        )
+
+    # Read before claiming: a storage failure here would otherwise leave the
+    # claim held forever, and a summary has no on-demand route to retry from.
+    content = ai_job.to_markdown(ai_job.file.creator.language)
+
+    if not _claim_docs_creation(ai_job):
+        raise DocumentCreationAlreadyInProgress(
+            f"Document creation is already in progress for AI job {ai_job.id}"
+        )
+
+    try:
+        docs_app_id = push_markdown_to_docs(
+            title=f"{ai_job.file.title} — compte-rendu"[:255],
+            content=content,
+            creator=ai_job.file.creator,
+            log_subject=ai_job.file.id,
+            parent_id=parent_document_id,
+        )
+        if docs_app_id is None:
+            logger.error(
+                "Request to Docs timed out for the summary of file %s, "
+                "do not considering this a failure to avoid creating multiple "
+                "files on docs",
+                ai_job.file.id,
+            )
+            # Same trade as the transcript: the link between the job and the
+            # Docs id is lost, the document is not.
+            return
+
+        logger.info(
+            "Summary document created in Docs for file %s => %s (in docs)",
+            ai_job.file.id,
+            docs_app_id,
+        )
+        AiFileJob.objects.filter(pk=ai_job.pk).update(
+            docs_app_id=docs_app_id,
+        )
     finally:
         AiFileJob.objects.filter(pk=ai_job.pk).update(
             docs_creation_in_progress=False,
