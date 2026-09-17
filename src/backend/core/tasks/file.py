@@ -644,6 +644,59 @@ def store_summary(remote_job_id, url):
     ai_summary_job.save()
 
 
+def push_markdown_to_docs(
+    *, title, content, creator, send_notification_email=True, log_subject=None
+):
+    """Create one document in Docs and return its id.
+
+    The single place this codebase talks to Docs' `create-for-owner` route.
+    Extracted from `create_document_in_docs` so a caller that is not an
+    `AiFileJob` -- the transcript import, which pushes three documents for one
+    recording -- goes through the same request, the same headers and the same
+    timeouts instead of a second copy of them.
+
+    `log_subject` is what a failure names in the log -- the file id for the
+    audio path, whose tests pin that message, and the document title for a
+    caller that has no single file to name.
+
+    Returns:
+        The Docs document id, or None when Docs took too long to answer. None
+        is not a failure: Docs may well have created the document, so the
+        caller must not retry, only give up on learning the id.
+
+    Raises:
+        requests_lib.RequestException: Docs refused or could not be reached.
+    """
+    try:
+        response = session.post(
+            urljoin(settings.DOCS_BASE_URL, "/api/v1.0/documents/create-for-owner/"),
+            json={
+                "title": title,
+                "content": content,
+                "email": creator.email,
+                "sub": creator.sub,
+                "send_notification_email": send_notification_email,
+            },
+            headers={
+                "Authorization": f"Bearer {settings.DOCS_SERVER_TO_SERVER_API_KEY}",
+            },
+            timeout=(20, 3 * 60),
+        )
+    except requests_lib.ReadTimeout:
+        # Docs may have created the document anyway: retrying would create a
+        # second one. The id is lost, the document is not.
+        return None
+
+    if response.status_code != 201:
+        logger.error(
+            "Failed to create document in Docs for file %s: %s",
+            title if log_subject is None else log_subject,
+            response.text,
+        )
+        response.raise_for_status()
+    return response.json()["id"]
+
+
 @app.task(
     queue=BACKEND_QUEUE,
     **build_retry_task_options(autoretry_for=(requests_lib.RequestException,)),
@@ -676,32 +729,21 @@ def create_document_in_docs(ai_job_id):
     content = ai_job.to_markdown(ai_job.file.creator.language)
 
     try:
-        response = session.post(
-            urljoin(settings.DOCS_BASE_URL, "/api/v1.0/documents/create-for-owner/"),
-            json={
-                "title": ai_job.file.title,
-                "content": content,
-                "email": ai_job.file.creator.email,
-                "sub": ai_job.file.creator.sub,
-                "send_notification_email": True,
-            },
-            headers={
-                "Authorization": f"Bearer {settings.DOCS_SERVER_TO_SERVER_API_KEY}",
-            },
-            timeout=(20, 3 * 60),
+        docs_app_id = push_markdown_to_docs(
+            title=ai_job.file.title,
+            content=content,
+            creator=ai_job.file.creator,
+            log_subject=ai_job.file.id,
         )
-        if response.status_code != 201:
+        if docs_app_id is None:
             logger.error(
-                "Failed to create document in Docs for file %s: %s",
+                "Request to Docs timed out for file %s, "
+                "do not considering this a failure to avoid creating multiple files on docs",
                 ai_job.file.id,
-                response.text,
             )
-            AiFileJob.objects.filter(pk=ai_job.pk).update(
-                docs_creation_in_progress=False
-            )
-            response.raise_for_status()
+            # We will "just" lose the link between the job and docs id but that's ok
+            return
 
-        docs_app_id = response.json()["id"]
         logger.info(
             "Document created in Docs for file %s => %s (in docs)",
             ai_job.file.id,
@@ -710,14 +752,6 @@ def create_document_in_docs(ai_job_id):
         AiFileJob.objects.filter(pk=ai_job.pk).update(
             docs_app_id=docs_app_id,
         )
-    except requests_lib.ReadTimeout:
-        logger.error(
-            "Request to Docs timed out for file %s, "
-            "do not considering this a failure to avoid creating multiple files on docs",
-            ai_job.file.id,
-        )
-        # We will "just" lose the link between the job and docs id but that's ok
-        return
     except requests_lib.RequestException:
         AiFileJob.objects.filter(pk=ai_job.pk).update(docs_creation_in_progress=False)
         raise
