@@ -67,6 +67,15 @@ urlpatterns = [
                     demo.import_transcript_as_recording,
                     name="demo-transcript-quality-import",
                 ),
+                # Second half of the import flow: summarises the corrected
+                # transcript of an imported recording and publishes it. Refuses
+                # anything that did not come from an import, so the audio
+                # pipeline's own summary stays the only one it ever has.
+                path(
+                    "demo/transcript-quality/ai-jobs/<uuid:pk>/summarize/",
+                    demo.summarize_imported_recording,
+                    name="demo-transcript-quality-summarize-imported",
+                ),
                 path(
                     "demo/transcript-quality/publish/",
                     demo.publish_transcript_quality_demo,

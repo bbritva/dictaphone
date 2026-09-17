@@ -45,6 +45,8 @@ webhook) is not involved in any of the three and is not changed by any of them.
 import json
 import logging
 from os.path import splitext
+from time import monotonic, sleep
+from urllib.parse import urljoin
 
 from django.conf import settings
 from django.http import Http404
@@ -75,6 +77,8 @@ from core.models import (
     FileUploadStateChoices,
 )
 from core.storage import get_storage_bucket_name, get_storage_for_file
+from core.tasks.file import push_markdown_to_docs
+from core.utils import format_transcript
 from core.webhook_models import WhisperXResponse
 
 logger = logging.getLogger(__name__)
@@ -89,6 +93,23 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
 #: The three drop zones, and whether the page may run without one.
 UPLOAD_FIELDS = (("transcript", True), ("glossary", False), ("calendar", False))
+
+#: How long the import flow waits for the summary service to finish a
+#: compte-rendu before giving up on it. The summarisation is one more Albert
+#: round trip over the whole transcript, so it is minutes, not seconds -- but
+#: it is not unbounded either, or the browser hangs on a dead worker.
+SUMMARY_POLL_TIMEOUT_SECONDS = 240
+
+#: Gap between two status polls. Short enough that a cached run answers fast,
+#: long enough not to hammer the service.
+SUMMARY_POLL_INTERVAL_SECONDS = 3
+
+#: The three documents the import flow pushes to Docs, in the order the modal
+#: lists them. `kind` is what the browser keys on; the label is what a failure
+#: message names, so "le compte-rendu n'a pas pu..." reads as French.
+DOC_RAW = "raw"
+DOC_CORRECTED = "corrected"
+DOC_SUMMARY = "summary"
 
 
 def _summary_service_url(path):
@@ -417,6 +438,59 @@ def _create_imported_recording(user, *, title, filename, transcript, language):
     return file
 
 
+def _docs_browser_url(docs_app_id):
+    """The link a human clicks, built the way the recording page builds it."""
+    return urljoin(settings.DOCS_BASE_URL, f"docs/{docs_app_id}/")
+
+
+def _push_document(creator, *, kind, label, title, markdown, log_subject=None):
+    """Push one markdown to Docs and describe what happened, win or lose.
+
+    Fails soft on purpose: the import creates three documents and the three are
+    independent. One of them failing must not cost the caller the other two, so
+    every outcome -- published, nothing to publish, Docs refused, Docs too slow
+    -- comes back as a row the modal can show, and never as an exception that
+    unwinds the whole import.
+
+    Returns:
+        A dict with `kind`, `title`, `url` and `error`. Exactly one of `url`
+        and `error` is set, so an empty stage cannot be shown as a success.
+    """
+    row = {"kind": kind, "title": title, "url": None, "docs_app_id": None, "error": None}
+
+    if not (markdown or "").strip():
+        row["error"] = (
+            f"{label} : le service de résumé n'a renvoyé aucun contenu à publier."
+        )
+        return row
+
+    try:
+        docs_app_id = push_markdown_to_docs(
+            title=title,
+            content=markdown,
+            creator=creator,
+            log_subject=log_subject,
+            # Three documents for one import would be three e-mails. The modal
+            # hands back the three links directly, so the mail adds nothing.
+            send_notification_email=False,
+        )
+    except requests_lib.RequestException as exc:
+        logger.error("Pushing « %s » to Docs failed: %s", title, exc)
+        row["error"] = f"{label} : la publication dans Docs a échoué ({exc})."
+        return row
+
+    if docs_app_id is None:
+        row["error"] = (
+            f"{label} : Docs n'a pas répondu à temps. Le document a peut-être "
+            "été créé, mais son lien est perdu."
+        )
+        return row
+
+    row["docs_app_id"] = docs_app_id
+    row["url"] = _docs_browser_url(docs_app_id)
+    return row
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 @parser_classes([MultiPartParser])
@@ -548,6 +622,45 @@ def import_transcript_as_recording(  # noqa: PLR0911  pylint: disable=too-many-r
         ai_job.id,
     )
 
+    # ---- the two transcript documents --------------------------------------
+    # Both markdowns are already in the answer the summary service just gave
+    # us: `before` is the transcript rendered with both correction stages
+    # closed -- i.e. the transcript as it was handed in -- and `after` is the
+    # corrected one. Nothing is recomputed, and no second call is made.
+    #
+    # The raw one is pushed straight from here and gets no `AiFileJob`. A
+    # second row of type `transcript` on the same file would be a second
+    # answer to "what is this recording's transcript", which the recording
+    # page, the retry action and `to_markdown` all assume there is one of. The
+    # raw text is a demo artefact, not the recording's transcript, so it lives
+    # in Docs and nowhere else -- and that needs no new job type and no
+    # migration.
+    documents = [
+        _push_document(
+            request.user,
+            kind=DOC_RAW,
+            log_subject=file.id,
+            label="Transcript brut",
+            title=f"{file.title} — transcript brut"[:255],
+            markdown=(payload.get("before") or {}).get("markdown"),
+        )
+    ]
+
+    corrected = _push_document(
+        request.user,
+        kind=DOC_CORRECTED,
+        log_subject=file.id,
+        label="Transcript corrigé",
+        title=f"{file.title} — transcript corrigé"[:255],
+        markdown=(payload.get("after") or {}).get("markdown"),
+    )
+    # Carried on the job, so "Ouvrir dans Docs" on the recording page opens
+    # this very document instead of creating a fourth one.
+    if corrected["docs_app_id"]:
+        ai_job.docs_app_id = corrected["docs_app_id"]
+        ai_job.save(update_fields=["docs_app_id"])
+    documents.append(corrected)
+
     return Response(
         {
             **payload,
@@ -557,6 +670,251 @@ def import_transcript_as_recording(  # noqa: PLR0911  pylint: disable=too-many-r
                 "duration_seconds": file.duration_seconds,
                 "ai_job_id": str(ai_job.id),
             },
+            # The compte-rendu is deliberately absent here: it is another
+            # Albert round trip, and making the browser wait for it would hold
+            # the two documents that already exist hostage to it. The modal
+            # asks for it on the next call.
+            "documents": documents,
         },
         status=status.HTTP_201_CREATED,
     )
+
+
+def _summarize_remotely(*, remote_job_id):
+    """Wait for one summarize job and return the URL of its result.
+
+    The summary service's summarize route is asynchronous: it answers with a
+    job id and, in the audio path, pushes the result back through a webhook
+    much later. The import flow has no later -- the browser is waiting on a
+    modal -- so it polls the service's own status route instead. Nothing new is
+    invented: the job was created the way the audio path creates it, and the
+    status route is the one the service already publishes.
+
+    Returns:
+        A `(summary_data_url, error_message)` pair; exactly one is None.
+    """
+    deadline = monotonic() + SUMMARY_POLL_TIMEOUT_SECONDS
+    headers = {"Authorization": f"Bearer {settings.AI_SERVICE_API_KEY}"}
+
+    while monotonic() < deadline:
+        sleep(SUMMARY_POLL_INTERVAL_SECONDS)
+        try:
+            poll = requests_lib.get(
+                _summary_service_url(f"async-jobs/summarize/{remote_job_id}"),
+                headers=headers,
+                timeout=30,
+            )
+        except requests_lib.RequestException as exc:
+            logger.error("Polling summary job %s failed: %s", remote_job_id, exc)
+            return None, f"Le service de résumé est devenu injoignable : {exc}"
+
+        # The status route reads Redis directly and 404s until the worker has
+        # written the task's first state. That is a normal early answer, not a
+        # lost job.
+        if poll.status_code == status.HTTP_404_NOT_FOUND:
+            continue
+        if not poll.ok:
+            return None, (
+                "Le service de résumé a répondu en HTTP "
+                f"{poll.status_code} pendant le suivi du compte-rendu."
+            )
+        try:
+            body = poll.json()
+        except ValueError:
+            return None, "Le suivi du compte-rendu n'a pas renvoyé de JSON."
+
+        if body.get("status") == "success":
+            url = body.get("summary_data_url")
+            if not url:
+                return None, (
+                    "Le service de résumé annonce un compte-rendu terminé sans "
+                    "en donner l'adresse."
+                )
+            return url, None
+        if body.get("status") == "failure":
+            return None, (
+                "Le service de résumé a échoué sur le compte-rendu "
+                f"({body.get('error_code') or 'raison inconnue'})."
+            )
+
+    return None, (
+        f"Le compte-rendu n'était toujours pas prêt après "
+        f"{SUMMARY_POLL_TIMEOUT_SECONDS // 60} minutes. Les transcripts, eux, "
+        "sont bien enregistrés."
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def summarize_imported_recording(  # noqa: PLR0911  pylint: disable=too-many-return-statements
+    request, pk
+):
+    """Summarise an imported recording's corrected transcript, and push it to Docs.
+
+    The second half of the import flow, and a separate call on purpose: the two
+    transcript documents exist the moment the correction is done, and must be
+    shown then rather than after another minutes-long model call. So the modal
+    shows them, then asks for this.
+
+    Only ever runs on a recording the import created (`source` is
+    `imported_transcript`). A recording that came from audio already gets its
+    compte-rendu from the ordinary pipeline, and nothing here touches that
+    path: the job created below is the same `summary` job the audio path
+    creates, made with the same request against the same route.
+    """
+    ai_job = get_object_or_404(
+        AiFileJob.objects.select_related("file", "file__creator"), pk=pk
+    )
+    file = ai_job.file
+    # Same three rules as the rerun panel: a job belongs to the creator of its
+    # file, and is gone with it.
+    if file.hard_deleted_at is not None:
+        raise Http404("This recording no longer exists.")
+    if file.creator != request.user:
+        raise Http404("This recording does not belong to you.")
+    if ai_job.type != AiJobTypeChoices.TRANSCRIPT:
+        raise Http404("This AI job is not a transcript.")
+    if ai_job.status != AiJobStatusChoices.SUCCESS:
+        raise Http404("This transcript is not finished.")
+
+    if file.source != FileSourceChoices.IMPORTED_TRANSCRIPT:
+        return Response(
+            {
+                "error": "Cette route ne sert qu'aux transcripts importés : un "
+                "enregistrement audio reçoit son compte-rendu par le "
+                "pipeline habituel."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # A double click must not buy a second document.
+    already = (
+        AiFileJob.objects.filter(
+            file=file,
+            type=AiJobTypeChoices.SUMMARIZE,
+            status=AiJobStatusChoices.SUCCESS,
+            docs_app_id__isnull=False,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if already is not None:
+        return Response(
+            {
+                "document": {
+                    "kind": DOC_SUMMARY,
+                    "title": f"{file.title} — compte-rendu"[:255],
+                    "url": _docs_browser_url(already.docs_app_id),
+                    "docs_app_id": already.docs_app_id,
+                    "error": None,
+                }
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    try:
+        stored = _stored_transcript_of(ai_job)
+    except OSError as exc:
+        logger.error("Could not read the stored transcript of %s: %s", ai_job.id, exc)
+        return Response(
+            {"error": f"Le transcript enregistré est illisible : {exc}"},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    try:
+        transcript = WhisperXResponse.model_validate_json(stored)
+    except ValidationError as exc:
+        return Response(
+            {"error": f"Le transcript enregistré n'a pas la forme attendue : {exc}"},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    summary_job = AiFileJob.objects.create(
+        remote_job_id=None,
+        file=file,
+        type=AiJobTypeChoices.SUMMARIZE,
+        status=AiJobStatusChoices.PENDING,
+        language=ai_job.language,
+    )
+
+    def failed(message, http_status=status.HTTP_502_BAD_GATEWAY):
+        """Mark the job failed, then say so.
+
+        Leaving it `pending` would make the recording page promise a
+        compte-rendu that is never coming.
+        """
+        summary_job.status = AiJobStatusChoices.FAILED
+        summary_job.save(update_fields=["status"])
+        return Response({"error": message}, status=http_status)
+
+    # Same request the audio path makes, field for field.
+    try:
+        created = requests_lib.post(
+            _summary_service_url("async-jobs/summarize/"),
+            json={
+                "user_sub": file.creator.sub,
+                "user_email": file.creator.email,
+                "language": ai_job.language,
+                "content": format_transcript(transcript),
+            },
+            headers={"Authorization": f"Bearer {settings.AI_SERVICE_API_KEY}"},
+            timeout=30,
+        )
+        created.raise_for_status()
+    except requests_lib.RequestException as exc:
+        logger.error("Creating the summary job for file %s failed: %s", file.id, exc)
+        return failed(f"Le compte-rendu n'a pas pu être lancé : {exc}")
+
+    try:
+        remote_job_id = created.json()["job_id"]
+    except (ValueError, KeyError):
+        return failed(
+            "Le service de résumé n'a pas renvoyé d'identifiant de tâche pour "
+            "le compte-rendu."
+        )
+
+    summary_job.remote_job_id = remote_job_id
+    summary_job.save(update_fields=["remote_job_id"])
+
+    summary_url, error = _summarize_remotely(remote_job_id=remote_job_id)
+    if error is not None:
+        return failed(error, http_status=status.HTTP_504_GATEWAY_TIMEOUT)
+
+    try:
+        download = requests_lib.get(summary_url, timeout=(10, 60))
+        download.raise_for_status()
+    except requests_lib.RequestException as exc:
+        logger.error("Downloading the summary of file %s failed: %s", file.id, exc)
+        return failed(f"Le compte-rendu produit n'a pas pu être récupéré : {exc}")
+
+    storage = get_storage_for_file(file)
+    try:
+        storage.connection.meta.client.put_object(
+            Bucket=get_storage_bucket_name(storage),
+            Key=summary_job.key,
+            Body=download.content,
+            ContentType="text/plain",
+        )
+    except (BotoCoreError, ClientError, OSError) as exc:
+        logger.error("Could not store the summary of %s: %s", file.id, exc)
+        return failed(f"Le compte-rendu n'a pas pu être enregistré : {exc}")
+
+    summary_job.status = AiJobStatusChoices.SUCCESS
+    summary_job.save(update_fields=["status"])
+
+    # Rendered by the model, not here: `to_markdown` is what the recording
+    # page's own "ouvrir dans Docs" would have produced for a summary job.
+    document = _push_document(
+        request.user,
+        kind=DOC_SUMMARY,
+        label="Compte-rendu",
+        log_subject=file.id,
+        title=f"{file.title} — compte-rendu"[:255],
+        markdown=summary_job.to_markdown(file.creator.language),
+    )
+    if document["docs_app_id"]:
+        summary_job.docs_app_id = document["docs_app_id"]
+        summary_job.save(update_fields=["docs_app_id"])
+
+    logger.info("Compte-rendu published for imported file %s", file.id)
+    return Response({"document": document}, status=status.HTTP_201_CREATED)
