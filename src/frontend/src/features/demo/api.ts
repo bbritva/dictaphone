@@ -148,6 +148,20 @@ export const runJobDemo = (
   })
 }
 
+/**
+ * One document the import tried to push to Docs.
+ *
+ * `url` and `error` are exclusive: a stage that produced nothing carries the
+ * reason instead of a link, so the modal never shows an empty success.
+ */
+export interface DemoDocument {
+  kind: 'raw' | 'corrected' | 'summary'
+  title: string
+  url: string | null
+  docs_app_id: string | null
+  error: string | null
+}
+
 /** The report, plus the recording the import created from it. */
 export interface DemoImported extends DemoReport {
   file: {
@@ -156,6 +170,10 @@ export interface DemoImported extends DemoReport {
     duration_seconds: number
     ai_job_id: string
   }
+  // The two transcript documents. The compte-rendu is not here: it is a second
+  // call, because it is another minutes-long model round trip and the two
+  // links must not wait for it.
+  documents: DemoDocument[]
 }
 
 /**
@@ -185,6 +203,20 @@ export const importTranscript = (input: {
   }
   return post<DemoImported>('demo/transcript-quality/import/', { body: form })
 }
+
+/**
+ * Summarise an imported recording and publish the compte-rendu to Docs.
+ *
+ * Deliberately after `importTranscript` rather than inside it: the two
+ * transcript documents exist as soon as the correction is done and are shown
+ * then, while this one runs behind a pending row. Called with the transcript
+ * job's id, the one `importTranscript` hands back.
+ */
+export const summarizeImported = (aiJobId: string) =>
+  post<{ document: DemoDocument }>(
+    `demo/transcript-quality/ai-jobs/${aiJobId}/summarize/`,
+    { headers: { 'Content-Type': 'application/json' } }
+  )
 
 export const publishDemo = (runId: string, which: 'before' | 'after') =>
   post<DemoPublished>('demo/transcript-quality/publish/', {

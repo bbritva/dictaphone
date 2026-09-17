@@ -302,3 +302,51 @@
     margin-top: 1rem;
   }
 }
+
+/* The three documents an import pushes to Docs. One row each, link or reason. */
+.demo-docs {
+  margin: 1rem 0 1.5rem;
+
+  &__title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    margin: 0 0 0.5rem;
+  }
+
+  &__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.4rem;
+  }
+
+  &__row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.5rem 0.8rem;
+    border-left: 3px solid var(--c--theme--colors--success-600, #18753c);
+    background: var(--c--theme--colors--greyscale-100, #f6f6f6);
+    font-size: 0.9rem;
+
+    &--pending {
+      border-left-color: var(--c--theme--colors--greyscale-400, #999);
+    }
+
+    &--failed {
+      border-left-color: var(--c--theme--colors--warning-600, #b34000);
+      background: var(--c--theme--colors--warning-100, #fff4ed);
+    }
+  }
+
+  &__label {
+    font-weight: 700;
+    min-width: 9.5rem;
+  }
+
+  &__state {
+    color: var(--c--theme--colors--greyscale-600, #666);
+  }
+}
